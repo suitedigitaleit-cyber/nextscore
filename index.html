@@ -352,7 +352,6 @@
         <button id="closeModal" class="btn" style="padding:8px 12px;">Chiudi</button>
       </div>
 
-      <!-- ✅ TABS: rimosso Marcatore, aggiunto Combo/Multiple -->
       <div class="microTabs">
         <button class="tabBtn active" data-mode="OPEN" id="tabOPEN">Analisi</button>
         <button class="tabBtn" data-mode="TOTALS" id="tabTOTALS">Under/Over</button>
@@ -392,8 +391,16 @@
           { name:"Away", prob: null, odds: 4.20 },
         ],
         totals: [
-          { point: 2.5, outcomes:[ {name:"Over", prob:null, odds:1.75}, {name:"Under", prob:null, odds:1.93} ] }
+          { point: 2.5, outcomes:[ {name:"Over", prob:null, odds:1.75}, {name:"Under", prob:null, odds:1.93} ] },
+          { point: 1.5, outcomes:[ {name:"Over", prob:null, odds:1.28}, {name:"Under", prob:null, odds:3.20} ] },
+          { point: 3.5, outcomes:[ {name:"Over", prob:null, odds:2.45}, {name:"Under", prob:null, odds:1.45} ] }
         ],
+        btts: {
+          outcomes: [
+            { name:"Yes", prob:null, odds:1.82 },
+            { name:"No", prob:null, odds:1.92 }
+          ]
+        }
       });
       return [
         mk("demo_1","Arsenal","Liverpool",90),
@@ -696,13 +703,17 @@
 
       return (
         `Ci sto 😄 Però in questo momento ho aperto un altro match.\n` +
-        `Per risponderti bene su *${title}* (quote + contesto), aprilo dalla lista qui dietro e te lo analizzo subito.\n` +
+        `Per risponderti bene su ${title}, aprilo dalla lista del campionato attuale e te lo analizzo subito.\n` +
         (when ? `⏱️ Kickoff: ${when}\n` : "") +
-        `Appena lo apri, posso anche proporti 2 combo “pronta-copia” 👇`
+        `Appena lo apri, posso anche proporti under/over, gol/no gol o una combo dedicata.`
       );
     }
 
-    function shouldInterceptAsOtherMatch(userText){
+    function suggestChangeCompetitionMessage(){
+      return "Non ho questa partita nel campionato attualmente selezionato. Prova a cambiare campionato oppure scegli una partita tra quelle disponibili.";
+    }
+
+    function detectOtherMatchRequest(userText){
       if (!currentEvent) return null;
 
       const mentioned = detectMentionedTeams(userText);
@@ -711,10 +722,11 @@
       const curHome = String(currentEvent?.home_team||"").trim();
       const curAway = String(currentEvent?.away_team||"").trim();
 
+      const normalizeMentioned = mentioned.map(normalizeTeamForHub);
       const mentionsCurrent =
         mentioned.includes(curHome) || mentioned.includes(curAway) ||
-        mentioned.map(normalizeTeamForHub).includes(normalizeTeamForHub(curHome)) ||
-        mentioned.map(normalizeTeamForHub).includes(normalizeTeamForHub(curAway));
+        normalizeMentioned.includes(normalizeTeamForHub(curHome)) ||
+        normalizeMentioned.includes(normalizeTeamForHub(curAway));
 
       if (mentioned.length >= 2){
         for (let i=0;i<mentioned.length;i++){
@@ -722,19 +734,21 @@
             const ev = findEventByTeams(mentioned[i], mentioned[j]);
             if (ev){
               const isCurrent = (String(ev.id) === String(currentEvent.id));
-              if (!isCurrent) return { ev };
+              if (!isCurrent) return { type:"switch", ev };
               return null;
             }
           }
         }
+        return mentionsCurrent ? null : { type:"not_found", teams: mentioned.slice(0,2) };
       }
 
       if (mentioned.length === 1 && !mentionsCurrent){
         const t = mentioned[0];
         const up = findUpcomingForTeam(t);
         if (up && String(up.id) !== String(currentEvent.id)){
-          return { ev: up };
+          return { type:"switch", ev: up };
         }
+        return { type:"not_found", teams:[t] };
       }
 
       return null;
@@ -759,9 +773,10 @@
       }
       return best;
     }
-    function bestTotalForPoint(bookmakers, point, overOrUnder){
+
+    function collectTotalsMarkets(bookmakers){
       const list = Array.isArray(bookmakers) ? bookmakers : [];
-      let best = null;
+      const map = new Map();
 
       for (const bm of list){
         const markets = Array.isArray(bm?.markets) ? bm.markets : [];
@@ -769,18 +784,62 @@
         if (!m) continue;
 
         const outcomes = Array.isArray(m?.outcomes) ? m.outcomes : [];
-        const o = outcomes.find(x =>
-          String(x?.name || "").toLowerCase() === String(overOrUnder).toLowerCase()
-          && Number(x?.point) === Number(point)
-        );
+        for (const o of outcomes){
+          const point = Number(o?.point);
+          const name = String(o?.name || "");
+          const price = Number(o?.price);
+          if (!Number.isFinite(point) || !name || !Number.isFinite(price) || price <= 0) continue;
 
-        const price = o?.price;
-        if (typeof price === "number" && price > 0){
-          if (best == null || price > best) best = price;
+          if (!map.has(point)){
+            map.set(point, {
+              point,
+              outcomes: [
+                { name:"Over", prob:null, odds:null },
+                { name:"Under", prob:null, odds:null }
+              ]
+            });
+          }
+          const row = map.get(point);
+          const target = row.outcomes.find(x => x.name.toLowerCase() === name.toLowerCase());
+          if (target && (target.odds == null || price > target.odds)){
+            target.odds = price;
+          }
         }
       }
-      return best;
+
+      return Array.from(map.values()).sort((a,b)=> a.point - b.point);
     }
+
+    function collectBttsMarket(bookmakers){
+      const list = Array.isArray(bookmakers) ? bookmakers : [];
+      let bestYes = null;
+      let bestNo = null;
+
+      for (const bm of list){
+        const markets = Array.isArray(bm?.markets) ? bm.markets : [];
+        const m = markets.find(x => x?.key === "btts");
+        if (!m) continue;
+
+        const outcomes = Array.isArray(m?.outcomes) ? m.outcomes : [];
+        for (const o of outcomes){
+          const n = String(o?.name || "").toLowerCase();
+          const price = Number(o?.price);
+          if (!Number.isFinite(price) || price <= 0) continue;
+          if (n === "yes" && (bestYes == null || price > bestYes)) bestYes = price;
+          if (n === "no" && (bestNo == null || price > bestNo)) bestNo = price;
+        }
+      }
+
+      if (bestYes == null && bestNo == null) return null;
+
+      return {
+        outcomes: [
+          { name:"Yes", prob:null, odds:bestYes },
+          { name:"No", prob:null, odds:bestNo }
+        ]
+      };
+    }
+
     function normalizeOddsEvent(ev){
       const home = ev?.home_team;
       const away = ev?.away_team;
@@ -790,21 +849,8 @@
       const qAway = bestOddsFromBookmakers(bms, "h2h", away);
       const qDraw = bestOddsFromBookmakers(bms, "h2h", "Draw");
 
-      let line = null;
-      outer: for (const bm of (Array.isArray(bms) ? bms : [])){
-        for (const m of (Array.isArray(bm?.markets) ? bm.markets : [])){
-          if (m?.key !== "totals") continue;
-          const outs = Array.isArray(m?.outcomes) ? m.outcomes : [];
-          const first = outs.find(x => typeof x?.point === "number");
-          if (first){
-            line = first.point;
-            break outer;
-          }
-        }
-      }
-
-      const qOver = (line != null) ? bestTotalForPoint(bms, line, "Over") : null;
-      const qUnder = (line != null) ? bestTotalForPoint(bms, line, "Under") : null;
+      const totals = collectTotalsMarkets(bms);
+      const btts = collectBttsMarket(bms);
 
       return {
         id: ev?.id,
@@ -816,12 +862,8 @@
           { name:"Draw", prob: null, odds: qDraw },
           { name:"Away", prob: null, odds: qAway },
         ],
-        totals: (line != null) ? [
-          { point: line, outcomes: [
-            { name:"Over", prob: null, odds: qOver },
-            { name:"Under", prob: null, odds: qUnder },
-          ]}
-        ] : [],
+        totals,
+        btts,
         _raw: ev
       };
     }
@@ -835,7 +877,7 @@
       url.searchParams.set("regions", regions);
       url.searchParams.set("live", "false");
       url.searchParams.set("count", String(MAX_COUNT));
-      url.searchParams.set("markets", "h2h,totals");
+      url.searchParams.set("markets", "h2h,totals,btts");
 
       return fetchJsonWithDebug(url, { headers:{ "Accept":"application/json" }});
     }
@@ -992,6 +1034,7 @@
 
       const h2h = Array.isArray(ev.outcomes) ? ev.outcomes : [];
       const totals = Array.isArray(ev.totals) ? ev.totals : [];
+      const btts = Array.isArray(ev?.btts?.outcomes) ? ev.btts.outcomes : [];
 
       const qHome = h2h.find(x => /home/i.test(x.name))?.odds ?? null;
       const qDraw = h2h.find(x => /draw/i.test(x.name))?.odds ?? null;
@@ -1001,6 +1044,9 @@
       const line = t0?.point ?? null;
       const qOver = t0?.outcomes?.find(x=>/over/i.test(x.name))?.odds ?? null;
       const qUnder = t0?.outcomes?.find(x=>/under/i.test(x.name))?.odds ?? null;
+
+      const qBttsYes = btts.find(x => /yes/i.test(x.name))?.odds ?? null;
+      const qBttsNo = btts.find(x => /no/i.test(x.name))?.odds ?? null;
 
       const pill = (v)=> (typeof v === "number" ? `<span class="chip" style="font-weight:900;">${esc(v.toFixed(2))}</span>` : `<span class="chip" style="opacity:.6;">—</span>`);
 
@@ -1042,7 +1088,7 @@
               <div class="text-xs font-extrabold text-slate-900 mb-2">Under/Over ${line ? `(linea ${esc(line)})` : ""}</div>
               <div class="flex items-center justify-between text-sm"><span>Over</span>${pill(qOver)}</div>
               <div class="flex items-center justify-between text-sm mt-2"><span>Under</span>${pill(qUnder)}</div>
-              <div class="text-[12px] text-slate-500 mt-2">Quote “best” tra bookmaker.</div>
+              <div class="text-[12px] text-slate-500 mt-2">Gol/NoGol: ${typeof qBttsYes === "number" ? `Gol ${qBttsYes.toFixed(2)}` : "—"} ${typeof qBttsNo === "number" ? `• NoGol ${qBttsNo.toFixed(2)}` : ""}</div>
             </div>
           </div>
 
@@ -1079,8 +1125,6 @@
       const soccer = isSoccerSportKey(sportKey);
       $.tabBTTS.classList.toggle("hidden", !soccer);
       $.tabEXACT.classList.toggle("hidden", !soccer);
-
-      // COMBOS sempre disponibile (lavora sui mercati che ci sono)
       $.tabCOMBOS.classList.remove("hidden");
 
       const active = $.tabBtns.find(b=>b.classList.contains("active"));
@@ -1090,7 +1134,7 @@
     }
 
     function buildStrongMarketRequest(mode, ev){
-      const line = ev?.totals?.[0]?.point ?? null;
+      const line = Array.isArray(ev?.totals) && ev.totals.length ? ev.totals[0]?.point : null;
       const hasLine = (typeof line === "number");
 
       if (mode === "TOTALS"){
@@ -1105,21 +1149,36 @@
         return `Dammi SUBITO 2 risultati esatti più probabili (con livello fiducia) e motivali in modo discorsivo.`;
       }
       if (mode === "COMBOS"){
-        return `Crea 3 proposte: (1) Singola migliore, (2) Combo prudente (2 selezioni), (3) Combo più aggressiva (2-3 selezioni). 
-Usa SOLO mercati disponibili nell’evento (1X2 e Totali; BTTS se presente). NON inventare quote che non vedi: se una quota manca scrivi “quota non disponibile” e proponi un’alternativa.
-Per ogni proposta: indica selezioni, perché ha senso (max 3 bullet) e livello fiducia (basso/medio/alto).`;
+        return `Crea una multipla usando più partite del tabellone attuale. Usa SOLO le selezioni che trovi in event.selections e non inventare quote. Restituisci: schedina proposta, breve logica, livello di rischio e una alternativa prudente.`;
       }
       return `Dammi SUBITO una previsione principale (1X2 o doppia chance) e motivala con 3 punti basati su quote e contesto. Poi proponi una alternativa prudente.`;
     }
 
-    function buildAntiHallucinationPrompt(userText, bundle){
+    function buildAntiHallucinationPrompt(userText, bundle, eventRef){
       const hasCtx = !!(bundle && bundle.ok && (bundle.context?.context || bundle.context));
       const ctxNote = hasCtx
         ? "Hai un CONTESTO dati (classifica/forma/infortuni quando presenti). Usalo."
         : "NON hai contesto: NON inventare dati (classifica, forma, indisponibili).";
 
-      const home = currentEvent?.home_team || "";
-      const away = currentEvent?.away_team || "";
+      const ev = eventRef || currentEvent || null;
+      const isMultiple = !!(ev && ev.type === "multiple");
+
+      const focusBlock = isMultiple
+        ? [
+            "MODALITÀ MULTIPLA:",
+            "- Non sei vincolata al match aperto.",
+            "- Devi commentare SOLO la schedina ricevuta in event.selections.",
+            "- Usa esclusivamente le quote e i mercati presenti nelle selezioni ricevute.",
+            "- Se manca qualcosa, non inventarla."
+          ].join("\n")
+        : [
+            "MATCH APERTO:",
+            `- ${(ev?.home_team || "")} vs ${(ev?.away_team || "")}.`,
+            "- Se l’utente chiede un ALTRO match o un’altra squadra:",
+            "  NON analizzare una partita che non hai aperta.",
+            "  Se è nel tabellone attuale, invitalo ad aprirla dalla lista.",
+            "  Se non è nel campionato attualmente selezionato, invitalo a cambiare campionato."
+          ].join("\n");
 
       return [
         "SEI BETTY (NextScore).",
@@ -1127,19 +1186,15 @@ Per ogni proposta: indica selezioni, perché ha senso (max 3 bullet) e livello f
         "REGOLA ASSOLUTA ANTI-ALLUCINAZIONI:",
         "- Non inventare NESSUN dato su rosa, indisponibili, squalificati, classifica, ultimi risultati.",
         "- Usa SOLO ciò che trovi in `context` quando presente.",
-        "- Se manca un dato, NON dire 'dato non disponibile nel contesto' in modo freddo.",
-        "  Usa una risposta più umana e breve (es: 'Ops, questo dettaglio qui mi sfugge 😅').",
+        "- Se manca un dato, non usare una formula fredda.",
+        "  Usa una risposta umana e breve.",
         "",
-        "MATCH APERTO:",
-        `- ${home} vs ${away}.`,
-        "- Se l’utente chiede un ALTRO match o un’altra squadra:",
-        "  NON dire che 'non hai info'.",
-        "  Di': che per analizzare quell’altro match deve aprire il tabellone giusto (aprire la card del match) e spiega cosa farai appena lo apre.",
+        focusBlock,
         "",
         "OBBLIGO DI OUTPUT:",
         "- Devi dare SUBITO una risposta utile e concreta.",
-        "- Se è un mercato: (1) Giocata principale (2) Alternativa prudente (3) Fiducia.",
-        "- Se è Combo/Multiple: (1) Singola (2) Combo prudente (3) Combo aggressiva, SOLO con mercati/quote disponibili.",
+        "- Se è un mercato singolo: (1) Giocata principale (2) Alternativa prudente (3) Fiducia.",
+        "- Se è una multipla: (1) Schedina proposta (2) Logica generale (3) Rischio (4) Alternativa prudente.",
         "",
         "LINGUA & STILE:",
         "- Italiano naturale, amichevole, premium.",
@@ -1174,8 +1229,19 @@ Per ogni proposta: indica selezioni, perché ha senso (max 3 bullet) e livello f
       });
     }
 
-    async function askBetty(userText){
-      if (!currentEvent){
+    async function askBetty(userText, opts = {}){
+      const eventPayload = opts.event || currentEvent;
+      const modePayload = opts.mode || currentMode;
+      const contextBundlePayload = opts.bundle !== undefined ? opts.bundle : currentContextBundle;
+      const contextPayload = opts.context !== undefined
+        ? opts.context
+        : ((contextBundlePayload && contextBundlePayload.ok) ? (contextBundlePayload.context?.context || contextBundlePayload.context) : null);
+
+      const resolvePayload = opts.resolve !== undefined
+        ? opts.resolve
+        : ((contextBundlePayload && contextBundlePayload.resolve) ? contextBundlePayload.resolve : null);
+
+      if (!eventPayload){
         addBettyBubble("Seleziona prima un match 😊");
         return "";
       }
@@ -1183,12 +1249,12 @@ Per ogni proposta: indica selezioni, perché ha senso (max 3 bullet) e livello f
       const sportKey = chosenSport();
 
       const payload = {
-        mode: currentMode,
-        prompt: buildAntiHallucinationPrompt(userText || "", currentContextBundle),
-        event: currentEvent,
-        context: (currentContextBundle && currentContextBundle.ok) ? (currentContextBundle.context?.context || currentContextBundle.context) : null,
-        resolve: (currentContextBundle && currentContextBundle.resolve) ? currentContextBundle.resolve : null,
-        history: chatHistory.slice(-10),
+        mode: modePayload,
+        prompt: buildAntiHallucinationPrompt(userText || "", contextBundlePayload, eventPayload),
+        event: eventPayload,
+        context: contextPayload,
+        resolve: resolvePayload,
+        history: opts.history || chatHistory.slice(-10),
         demo: isDemoMode,
         sport: sportKey
       };
@@ -1200,9 +1266,229 @@ Per ogni proposta: indica selezioni, perché ha senso (max 3 bullet) e livello f
         return text;
       }catch(e){
         const dbg = e?._debug || { where:"betty /chat", error:String(e?.message || e) };
-        dbgWrite({ where:"askBetty", ...dbg });
+        dbgWrite({ where:"askBetty", ...dbg, payload });
         return `⚠️ Errore chiamata Betty.\nDettaglio: ${String(e?.message || e)}`;
       }
+    }
+
+    function isMultiplaRequest(text){
+      const t = String(text || "").toLowerCase();
+      return (
+        t.includes("multipla") ||
+        t.includes("schedina") ||
+        t.includes("combo") ||
+        t.includes("multiple")
+      );
+    }
+
+    function extractSlipSize(text){
+      const t = String(text || "").toLowerCase();
+      const m = t.match(/\bda\s*(\d+)\b/);
+      if (m && Number(m[1]) > 1) return Math.min(8, Number(m[1]));
+      const m2 = t.match(/\b(\d+)\s*(partite|eventi|match)\b/);
+      if (m2 && Number(m2[1]) > 1) return Math.min(8, Number(m2[1]));
+      return 3;
+    }
+
+    function shuffleArray(arr){
+      const a = arr.slice();
+      for (let i = a.length - 1; i > 0; i--){
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    }
+
+    function getOutcomeOdds(ev, name){
+      const outs = Array.isArray(ev?.outcomes) ? ev.outcomes : [];
+      return outs.find(x => String(x?.name || "").toLowerCase() === String(name).toLowerCase())?.odds ?? null;
+    }
+
+    function getTotalOdds(ev, point, name){
+      const totals = Array.isArray(ev?.totals) ? ev.totals : [];
+      const row = totals.find(t => Number(t?.point) === Number(point));
+      return row?.outcomes?.find(x => String(x?.name || "").toLowerCase() === String(name).toLowerCase())?.odds ?? null;
+    }
+
+    function getBttsOdds(ev, name){
+      const outs = Array.isArray(ev?.btts?.outcomes) ? ev.btts.outcomes : [];
+      return outs.find(x => String(x?.name || "").toLowerCase() === String(name).toLowerCase())?.odds ?? null;
+    }
+
+    function pickSelectionForMatch(ev){
+      const over15 = getTotalOdds(ev, 1.5, "Over");
+      if (typeof over15 === "number"){
+        return {
+          match_id: ev.id,
+          home_team: ev.home_team,
+          away_team: ev.away_team,
+          market: "Totali",
+          pick: "Over 1.5",
+          odds: over15
+        };
+      }
+
+      const under45 = getTotalOdds(ev, 4.5, "Under");
+      if (typeof under45 === "number"){
+        return {
+          match_id: ev.id,
+          home_team: ev.home_team,
+          away_team: ev.away_team,
+          market: "Totali",
+          pick: "Under 4.5",
+          odds: under45
+        };
+      }
+
+      const bttsYes = getBttsOdds(ev, "Yes");
+      if (typeof bttsYes === "number"){
+        return {
+          match_id: ev.id,
+          home_team: ev.home_team,
+          away_team: ev.away_team,
+          market: "Gol/NoGol",
+          pick: "Gol",
+          odds: bttsYes
+        };
+      }
+
+      const over25 = getTotalOdds(ev, 2.5, "Over");
+      if (typeof over25 === "number"){
+        return {
+          match_id: ev.id,
+          home_team: ev.home_team,
+          away_team: ev.away_team,
+          market: "Totali",
+          pick: "Over 2.5",
+          odds: over25
+        };
+      }
+
+      const under35 = getTotalOdds(ev, 3.5, "Under");
+      if (typeof under35 === "number"){
+        return {
+          match_id: ev.id,
+          home_team: ev.home_team,
+          away_team: ev.away_team,
+          market: "Totali",
+          pick: "Under 3.5",
+          odds: under35
+        };
+      }
+
+      const homeOdds = getOutcomeOdds(ev, "Home");
+      const awayOdds = getOutcomeOdds(ev, "Away");
+      const drawOdds = getOutcomeOdds(ev, "Draw");
+
+      if (typeof homeOdds === "number" && typeof awayOdds === "number"){
+        if (homeOdds <= awayOdds){
+          return {
+            match_id: ev.id,
+            home_team: ev.home_team,
+            away_team: ev.away_team,
+            market: "1X2",
+            pick: ev.home_team,
+            odds: homeOdds
+          };
+        }
+        return {
+          match_id: ev.id,
+          home_team: ev.home_team,
+          away_team: ev.away_team,
+          market: "1X2",
+          pick: ev.away_team,
+          odds: awayOdds
+        };
+      }
+
+      if (typeof drawOdds === "number"){
+        return {
+          match_id: ev.id,
+          home_team: ev.home_team,
+          away_team: ev.away_team,
+          market: "1X2",
+          pick: "Pareggio",
+          odds: drawOdds
+        };
+      }
+
+      return null;
+    }
+
+    function calcComboOdds(selections){
+      return selections.reduce((acc, s) => acc * Number(s?.odds || 1), 1);
+    }
+
+    function buildMultipleSlipFromBoard(requestedCount){
+      const count = Math.max(2, Math.min(Number(requestedCount || 3), 8));
+
+      let pool = Array.isArray(lastData) ? lastData.slice() : [];
+      if (!pool.length) return null;
+
+      if (currentEvent){
+        const others = pool.filter(x => String(x?.id) !== String(currentEvent?.id));
+        if (others.length >= count){
+          pool = others;
+        }
+      }
+
+      pool = shuffleArray(pool);
+
+      const selections = [];
+      for (const ev of pool){
+        const pick = pickSelectionForMatch(ev);
+        if (!pick) continue;
+
+        const duplicate = selections.find(x => String(x.match_id) === String(pick.match_id));
+        if (duplicate) continue;
+
+        selections.push(pick);
+        if (selections.length >= count) break;
+      }
+
+      if (selections.length < 2) return null;
+
+      return {
+        type: "multiple",
+        requested_count: count,
+        built_count: selections.length,
+        source: "tabellone_attuale",
+        competition: chosenSport(),
+        selections,
+        total_odds: Number(calcComboOdds(selections).toFixed(2))
+      };
+    }
+
+    async function handleComboRequest(userText, sourceLabel = "Combo/Multiple"){
+      const count = extractSlipSize(userText || "");
+      const slip = buildMultipleSlipFromBoard(count);
+
+      if (!slip){
+        const msg = "Non ho abbastanza partite con mercati disponibili nel tabellone attuale. Prova a cambiare campionato oppure aggiorna i match.";
+        addBettyBubble(msg);
+        chatHistory.push({ role:"assistant", content: msg });
+        return;
+      }
+
+      const prompt = userText && userText.trim()
+        ? userText.trim()
+        : `Fammi una multipla da ${slip.built_count} partite usando le selezioni ricevute.`;
+
+      addUserBubble(sourceLabel);
+      chatHistory.push({ role:"user", content: prompt });
+
+      const th = addThinking();
+      const ans = await askBetty(prompt, {
+        mode: "COMBOS",
+        event: slip,
+        context: null,
+        resolve: null,
+        bundle: null
+      });
+      removeThinking(th);
+
+      addBettyBubble(ans);
+      chatHistory.push({ role:"assistant", content: ans });
     }
 
     window.openBetty = async function(ev){
@@ -1271,6 +1557,11 @@ Per ogni proposta: indica selezioni, perché ha senso (max 3 bullet) e livello f
           return;
         }
 
+        if (btn.dataset.mode === "COMBOS"){
+          await handleComboRequest(`Fammi una multipla da 3 partite usando il tabellone attuale.`, "Combo/Multiple");
+          return;
+        }
+
         const strong = buildStrongMarketRequest(btn.dataset.mode, currentEvent);
 
         addUserBubble(btn.textContent);
@@ -1290,17 +1581,31 @@ Per ogni proposta: indica selezioni, perché ha senso (max 3 bullet) e livello f
       if (!t) return;
       $.chatInput.value = "";
 
-      addUserBubble(t);
-
-      const intercept = shouldInterceptAsOtherMatch(t);
-      if (intercept && intercept.ev){
-        const msg = suggestSwitchMessage(intercept.ev);
+      const otherMatch = detectOtherMatchRequest(t);
+      if (otherMatch?.type === "switch" && otherMatch.ev){
+        addUserBubble(t);
+        const msg = suggestSwitchMessage(otherMatch.ev);
         addBettyBubble(msg);
         chatHistory.push({ role:"user", content: t });
         chatHistory.push({ role:"assistant", content: msg });
         return;
       }
 
+      if (otherMatch?.type === "not_found"){
+        addUserBubble(t);
+        const msg = suggestChangeCompetitionMessage();
+        addBettyBubble(msg);
+        chatHistory.push({ role:"user", content: t });
+        chatHistory.push({ role:"assistant", content: msg });
+        return;
+      }
+
+      if (currentMode === "COMBOS" || isMultiplaRequest(t)){
+        await handleComboRequest(t, t);
+        return;
+      }
+
+      addUserBubble(t);
       chatHistory.push({ role:"user", content: t });
 
       const th = addThinking();
